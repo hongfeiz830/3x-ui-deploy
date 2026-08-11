@@ -1,10 +1,10 @@
 #!/bin/bash
 # ============================================================
-# 3x-ui 一键部署脚本（参数化）
+# 3x-ui 一键部署脚本（参数化）v2 — 修复版
 # 协议：VLESS + Reality
-# 访问：纯 IP + 443 端口
-# 使用：curl -sL <脚本地址> | bash -s -- --username=xxx --password=xxx
-# 或：bash deploy-3xui.sh --username=xxx --password=xxx
+# 访问：纯 IP + 自定义端口
+# 使用：curl -sL <脚本地址> | bash -s -- --password=xxx
+# 或：  bash deploy-3xui.sh --password=xxx --clean
 # ============================================================
 
 set -e
@@ -12,7 +12,7 @@ set -e
 # ---- 默认参数 ----
 PANEL_PORT=10601
 PANEL_PATH="xui"
-USERNAME="admin"
+USERNAME="zhanghf"
 PASSWORD=""
 VLESS_PORT=443
 REALITY_DOMAIN="www.microsoft.com"
@@ -48,17 +48,19 @@ parse_args() {
                 echo "Usage: bash deploy-3xui.sh [OPTIONS]"
                 echo ""
                 echo "Options:"
-                echo "  --username=NAME        面板用户名 (默认: admin)"
+                echo "  --username=NAME        面板用户名 (默认: zhanghf)"
                 echo "  --password=PASS        面板密码 (必填)"
                 echo "  --panel-port=PORT      面板端口 (默认: 10601)"
                 echo "  --panel-path=PATH      面板路径 (默认: xui)"
                 echo "  --vless-port=PORT      VLESS节点端口 (默认: 443)"
                 echo "  --reality-domain=DOM   Reality伪装域名 (默认: www.microsoft.com)"
                 echo "  --ssh-port=PORT        SSH端口 (可选，用于防火墙放行)"
-                echo "  --clean                清除旧安装，全新覆盖部署"
+                echo "  --clean                清除旧安装（含Docker），全新覆盖部署"
                 echo ""
                 echo "Example:"
+                echo "  # 全新 VPS"
                 echo "  bash deploy-3xui.sh --password=mypassword123"
+                echo "  # 覆盖安装（清除旧的再装）"
                 echo "  bash deploy-3xui.sh --password=xxx --clean"
                 exit 0
                 ;;
@@ -94,38 +96,86 @@ check_system() {
     esac
 }
 
-# ---- 清除旧安装 ----
+# ---- 清除旧安装（修复版） ----
 clean_old_install() {
     step "0/7 清除旧安装"
 
-    # 停止服务
-    systemctl stop x-ui 2>/dev/null || true
-    systemctl stop x-ui 2>/dev/null || true
+    # ===== 第一步：先杀进程，再删文件 =====
+    info "停止所有 x-ui / xray 进程..."
 
-    # 卸载旧 3x-ui / x-ui
-    if [ -f /usr/local/x-ui/x-ui ]; then
-        /usr/local/x-ui/x-ui uninstall 2>/dev/null || true
+    # 停止 systemd 服务
+    systemctl stop x-ui 2>/dev/null || true
+    systemctl disable x-ui 2>/dev/null || true
+
+    # 停止 Docker 容器（如果存在）
+    if command -v docker &>/dev/null; then
+        info "检测到 Docker，清理 Docker 相关 3x-ui 容器..."
+        # 停止并删除所有 3x-ui / x-ui 相关容器
+        docker ps -a --format '{{.Names}}' 2>/dev/null | grep -iE 'x-ui|3x-ui|xui' | while read -r cname; do
+            warn "停止并删除 Docker 容器: $cname"
+            docker stop "$cname" 2>/dev/null || true
+            docker rm -f "$cname" 2>/dev/null || true
+        done
+        # 删除相关镜像
+        docker images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null | grep -iE 'x-ui|3x-ui|xui' | while read -r img; do
+            warn "删除 Docker 镜像: $img"
+            docker rmi -f "$img" 2>/dev/null || true
+        done
+        # 清理悬空卷
+        docker volume ls --format '{{.Name}}' 2>/dev/null | grep -iE 'x-ui|3x-ui|xui' | while read -r vol; do
+            warn "删除 Docker 卷: $vol"
+            docker volume rm -f "$vol" 2>/dev/null || true
+        done
     fi
 
-    # 强制清除残留
-    systemctl disable x-ui 2>/dev/null || true
-    rm -rf /usr/local/x-ui/ 2>/dev/null || true
-    rm -rf /etc/x-ui/ 2>/dev/null || true
-    rm -rf /etc/systemd/system/x-ui.service 2>/dev/null || true
-    rm -rf /etc/systemd/system/x-ui.service.d 2>/dev/null || true
-    rm -f /usr/local/bin/x-ui 2>/dev/null || true
+    # 强制杀死所有残留进程（必须在删文件之前）
+    pkill -9 -f "x-ui" 2>/dev/null || true
+    pkill -9 -f "xray" 2>/dev/null || true
+    sleep 1
 
-    # 清除旧 xray
-    rm -rf /usr/local/xray/ 2>/dev/null || true
+    # ===== 第二步：尝试官方卸载（非交互） =====
+    if [ -f /usr/local/x-ui/x-ui ]; then
+        info "尝试执行官方卸载..."
+        # 用管道喂入 y 确认交互卸载
+        echo "y" | /usr/local/x-ui/x-ui uninstall 2>/dev/null || true
+    fi
 
-    # 重载 systemd
+    # ===== 第三步：彻底删除所有残留文件和目录 =====
+    info "删除残留文件..."
+    rm -rf /usr/local/x-ui/          2>/dev/null || true
+    rm -rf /usr/local/x-ui/bin/      2>/dev/null || true
+    rm -rf /etc/x-ui/                2>/dev/null || true
+    rm -rf /etc/systemd/system/x-ui.service        2>/dev/null || true
+    rm -rf /etc/systemd/system/x-ui.service.d      2>/dev/null || true
+    rm -f  /usr/local/bin/x-ui       2>/dev/null || true
+    rm -rf /usr/local/xray/          2>/dev/null || true
+    rm -rf /var/log/x-ui/            2>/dev/null || true
+    rm -rf /opt/x-ui/                2>/dev/null || true
+    rm -f  /tmp/xui-cookie.txt       2>/dev/null || true
+    rm -f  /tmp/vless-reality-inbound.json 2>/dev/null || true
+
+    # 删除 Docker compose 文件（如果存在）
+    rm -f  /root/docker-compose.yml  2>/dev/null || true
+    rm -f  /root/3x-ui-compose.yml   2>/dev/null || true
+
+    # ===== 第四步：重载 systemd =====
     systemctl daemon-reload
+    systemctl reset-failed x-ui 2>/dev/null || true
 
-    # 杀残留进程
-    pkill -f x-ui 2>/dev/null || true
-    pkill -f xray 2>/dev/null || true
+    # ===== 第五步：验证清理结果 =====
+    sleep 1
+    local leftover=0
+    if [ -d /usr/local/x-ui/ ]; then       warn "/usr/local/x-ui/ 仍存在"; leftover=1; fi
+    if [ -d /etc/x-ui/ ]; then             warn "/etc/x-ui/ 仍存在"; leftover=1; fi
+    if pgrep -f "x-ui" >/dev/null 2>&1; then warn "x-ui 进程仍在运行"; leftover=1; fi
+    if pgrep -f "xray" >/dev/null 2>&1; then warn "xray 进程仍在运行"; leftover=1; fi
 
-    info "旧安装已清除"
+    if [ "$leftover" = "0" ]; then
+        info "旧安装已彻底清除"
+    else
+        warn "部分残留未清除，继续安装可能冲突"
+        warn "建议手动检查后重新运行"
+    fi
 }
 
 # ---- 系统更新 + 依赖安装 ----
@@ -162,12 +212,10 @@ gen_uuid() {
 
 # ---- 生成 Reality 密钥对 ----
 gen_reality_keys() {
-    # 生成随机 PrivateKey 和 PublicKey
     local keys
     if command -v xray &>/dev/null; then
         keys=$(xray x25519)
     else
-        # 兜底：用 openssl 生成
         keys=$(/usr/local/x-ui/bin/xray-linux-arm64 x25519 2>/dev/null || \
                /usr/local/x-ui/bin/xray-linux-amd64 x25519 2>/dev/null || \
                echo "PRIVATE_KEY=fallback PUBLIC_KEY=fallback")
@@ -176,7 +224,7 @@ gen_reality_keys() {
     PUBLIC_KEY=$(echo "$keys" | grep -i "public" | awk '{print $NF}')
 }
 
-# ---- 配置面板 ----
+# ---- 配置面板（修复版：不静默吞错，加端口验证） ----
 config_panel() {
     step "3/7 配置面板"
 
@@ -189,15 +237,51 @@ config_panel() {
     info "Reality PrivateKey: $PRIVATE_KEY"
     info "Reality PublicKey: $PUBLIC_KEY"
 
-    # 设置面板端口、路径、用户名密码
-    /usr/local/x-ui/x-ui setting -port "$PANEL_PORT" \
+    # 停止面板再配置（避免端口占用导致设置失败）
+    systemctl stop x-ui 2>/dev/null || true
+    sleep 1
+
+    # 设置面板端口、路径、用户名密码 —— 不再用 2>/dev/null || true，让错误暴露
+    info "设置面板端口=$PANEL_PORT 路径=/$PANEL_PATH ..."
+    SETTING_OUTPUT=$(/usr/local/x-ui/x-ui setting -port "$PANEL_PORT" \
         -path "$PANEL_PATH" \
         -username "$USERNAME" \
-        -password "$PASSWORD" 2>/dev/null || true
+        -password "$PASSWORD" 2>&1) || {
+        warn "setting 命令输出: $SETTING_OUTPUT"
+        error "面板配置失败，请检查 x-ui setting 命令是否可用"
+    }
+    info "setting 命令执行完成"
 
     # 重启面板使配置生效
     systemctl restart x-ui
-    sleep 2
+    sleep 3
+
+    # ===== 关键修复：验证面板是否真正监听在指定端口 =====
+    info "验证面板端口..."
+    local retry=0
+    local max_retry=5
+    while [ $retry -lt $max_retry ]; do
+        if ss -tlnp 2>/dev/null | grep -q ":${PANEL_PORT} " ; then
+            info "面板已成功监听端口: $PANEL_PORT"
+            break
+        fi
+        retry=$((retry + 1))
+        warn "端口 $PANEL_PORT 尚未监听，重试 ($retry/$max_retry)..."
+        systemctl restart x-ui 2>/dev/null || true
+        sleep 2
+    done
+
+    if [ $retry -ge $max_retry ]; then
+        # 检查面板实际在哪个端口
+        local actual_port
+        actual_port=$(ss -tlnp 2>/dev/null | grep -i x-ui | awk '{print $4}' | grep -oE '[0-9]+$' | head -1)
+        if [ -n "$actual_port" ]; then
+            error "面板未在端口 $PANEL_PORT 上监听，实际端口可能是: $actual_port\n请检查: ss -tlnp | grep x-ui\n日志: journalctl -u x-ui -e"
+        else
+            error "面板未在任何端口上监听，请检查日志: journalctl -u x-ui -e"
+        fi
+    fi
+
     info "面板配置完成: https://<你的IP>:$PANEL_PORT/$PANEL_PATH"
 }
 
@@ -205,7 +289,6 @@ config_panel() {
 config_firewall() {
     step "4/7 防火墙配置"
 
-    # 放行端口
     for port in "$PANEL_PORT" "$VLESS_PORT" 80 443; do
         if command -v ufw &>/dev/null; then
             ufw allow ${port}/tcp 2>/dev/null && info "UFW 放行端口: $port"
@@ -214,7 +297,6 @@ config_firewall() {
         fi
     done
 
-    # SSH 端口
     if [ -n "$SSH_PORT" ]; then
         if command -v ufw &>/dev/null; then
             ufw allow ${SSH_PORT}/tcp 2>/dev/null
@@ -224,7 +306,6 @@ config_firewall() {
         info "SSH 端口放行: $SSH_PORT"
     fi
 
-    # 如果 UFW 没有启用，不强制启用（避免锁死 SSH）
     if command -v ufw &>/dev/null; then
         UFW_STATUS=$(ufw status | head -1)
         if echo "$UFW_STATUS" | grep -q "inactive"; then
@@ -241,10 +322,8 @@ config_firewall() {
 create_inbound() {
     step "5/7 创建 VLESS + Reality 入站"
 
-    # 获取本机 IP
     SERVER_IP=$(curl -s4 ifconfig.me || curl -s4 ip.sb || echo "YOUR_IP")
 
-    # 构造入站 JSON
     cat > /tmp/vless-reality-inbound.json << EOF
 {
   "remark": "vless-reality",
@@ -314,19 +393,18 @@ create_inbound() {
 EOF
 
     # 通过 3x-ui API 添加入站
-    # 先登录获取 cookie
+    info "登录面板 API..."
     LOGIN_RESP=$(curl -sk -c /tmp/xui-cookie.txt -X POST \
-        "http://127.0.0.1:${PANEL_PORT}/${PANEL_PATH}/login" \
+        "https://127.0.0.1:${PANEL_PORT}/${PANEL_PATH}/login" \
         -H "Content-Type: application/x-www-form-urlencoded" \
         -d "username=${USERNAME}&password=${PASSWORD}")
 
-    # 添加入站
+    info "添加 VLESS+Reality 入站..."
     ADD_RESP=$(curl -sk -b /tmp/xui-cookie.txt -X POST \
-        "http://127.0.0.1:${PANEL_PORT}/${PANEL_PATH}/panel/inbound/add" \
+        "https://127.0.0.1:${PANEL_PORT}/${PANEL_PATH}/panel/inbound/add" \
         -H "Content-Type: application/json" \
         -d @/tmp/vless-reality-inbound.json)
 
-    # 检查结果
     if echo "$ADD_RESP" | grep -q "true"; then
         info "VLESS + Reality 入站创建成功"
     else
@@ -351,7 +429,6 @@ print_summary() {
 
     SERVER_IP=$(curl -s4 ifconfig.me || echo "YOUR_IP")
 
-    # 生成 VLESS 分享链接
     VLESS_LINK="vless://${VLESS_UUID}@${SERVER_IP}:${VLESS_PORT}?security=reality&encryption=none&pbk=${PUBLIC_KEY}&type=tcp&flow=xtls-rprx-vision&fp=chrome&sni=${REALITY_DOMAIN}&sid=#3xui-reality"
 
     echo ""
@@ -386,7 +463,6 @@ print_summary() {
     echo -e "${GREEN}═══════════════════════════════════════════════════════════${NC}"
     echo ""
 
-    # 保存部署信息到文件
     cat > /root/3xui-deploy-info.txt << DEPLOY_EOF
 # 3x-ui 部署信息
 # 部署时间: $(date '+%Y-%m-%d %H:%M:%S')
