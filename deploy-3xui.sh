@@ -193,18 +193,28 @@ install_3xui() {
     # 通过环境变量预设面板配置，官方安装器会直接使用，不会生成随机值
     # 官方支持的环境变量：XUI_USERNAME, XUI_PASSWORD, XUI_PANEL_PORT, XUI_WEB_BASE_PATH
     # NONINTERACTIVE=1 跳过交互式数据库选择，默认用 SQLite
+    # XUI_SSL_MODE=ip 让官方安装器自动申请 Let's Encrypt IP 证书（真实证书，浏览器信任）
     export XUI_USERNAME="$USERNAME"
     export XUI_PASSWORD="$PASSWORD"
     export XUI_PANEL_PORT="$PANEL_PORT"
     export XUI_WEB_BASE_PATH="$PANEL_PATH"
     export NONINTERACTIVE=1
     export XUI_DB_TYPE=sqlite
+    export XUI_SSL_MODE=ip
 
-    info "传入环境变量: 用户=$USERNAME 端口=$PANEL_PORT 路径=$PANEL_PATH"
+    # ACME HTTP-01 验证需要端口 80，提前放行
+    if command -v ufw &>/dev/null; then
+        ufw allow 80/tcp 2>/dev/null || true
+    elif command -v firewall-cmd &>/dev/null; then
+        firewall-cmd --permanent --add-port=80/tcp 2>/dev/null || true
+        firewall-cmd --reload 2>/dev/null || true
+    fi
+
+    info "传入环境变量: 用户=$USERNAME 端口=$PANEL_PORT 路径=$PANEL_PATH SSL=Let's Encrypt IP证书"
     bash <(curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh)
 
     # 清理环境变量
-    unset XUI_USERNAME XUI_PASSWORD XUI_PANEL_PORT XUI_WEB_BASE_PATH NONINTERACTIVE XUI_DB_TYPE
+    unset XUI_USERNAME XUI_PASSWORD XUI_PANEL_PORT XUI_WEB_BASE_PATH NONINTERACTIVE XUI_DB_TYPE XUI_SSL_MODE
 
     # 等待服务启动
     sleep 3
@@ -266,24 +276,17 @@ config_panel() {
     }
     info "setting 命令执行完成"
 
-    # ===== 生成自签证书并开启 HTTPS =====
-    info "生成自签 SSL 证书..."
-    mkdir -p /etc/x-ui/ssl
-    # 获取本机 IP 作为证书 CN
-    LOCAL_IP=$(curl -s4 ifconfig.me 2>/dev/null || echo "127.0.0.1")
-    openssl req -new -newkey rsa:2048 -nodes -x509 -days 3650 \
-        -keyout /etc/x-ui/ssl/key.pem \
-        -out /etc/x-ui/ssl/cert.pem \
-        -subj "/CN=${LOCAL_IP}" 2>/dev/null
-    chmod 600 /etc/x-ui/ssl/key.pem
-
-    # 配置面板使用 SSL 证书（flag 名为 -webCert / -webCertKey，设了就自动开启 HTTPS）
-    info "开启面板 HTTPS..."
-    /usr/local/x-ui/x-ui setting -webCert /etc/x-ui/ssl/cert.pem \
-        -webCertKey /etc/x-ui/ssl/key.pem 2>&1 || {
-        warn "SSL 证书配置可能失败，面板将以 HTTP 模式运行"
-    }
-    info "SSL 证书配置完成"
+    # ===== SSL 由官方安装器通过 Let's Encrypt IP 证书自动配置 =====
+    # 不再需要自签证书，官方安装器已通过 XUI_SSL_MODE=ip 自动申请真实证书
+    # 验证 SSL 是否配置成功
+    local cert_check
+    cert_check=$(/usr/local/x-ui/x-ui setting -getCert true 2>&1)
+    if echo "$cert_check" | grep -q "cert:" && ! echo "$cert_check" | grep -q 'cert: $'; then
+        info "SSL 证书已配置（Let's Encrypt）"
+    else
+        warn "SSL 证书未检测到，面板可能以 HTTP 模式运行"
+        warn "可手动配置: x-ui cert -webCert <cert路径> -webCertKey <key路径>"
+    fi
 
     # 重启面板使配置生效
     systemctl restart x-ui
