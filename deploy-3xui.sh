@@ -1,6 +1,6 @@
 #!/bin/bash
 set -e
-PANEL_PORT=70830
+PANEL_PORT=10601
 PANEL_PATH="xui"
 USERNAME="admin"
 PASSWORD=""
