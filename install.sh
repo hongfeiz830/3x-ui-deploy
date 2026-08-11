@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# 3x-ui 一键部署脚本
+# 3x-ui 一键部署脚本（支持新 VPS 初始化 & 老 VPS 覆盖安装）
 # 特性：纯 IP 访问 + HTTPS 自签证书 + 自定义端口/账号/根路径
 # 适用系统：Ubuntu / Debian / CentOS / Rocky / AlmaLinux
 #
@@ -18,6 +18,8 @@ CERT_DIR="/etc/x-ui/ssl"    # SSL 证书存放目录
 CERT_FILE="${CERT_DIR}/panel.crt"
 KEY_FILE="${CERT_DIR}/panel.key"
 CERT_DAYS="3650"            # 证书有效期（天）
+TIMEZONE="Asia/Shanghai"    # 系统时区
+ENABLE_BBR="true"           # 是否开启 BBR 拥塞控制
 
 # ============================================================
 # 颜色与工具函数
@@ -41,6 +43,19 @@ if [ "$EUID" -ne 0 ]; then
     exit 1
 fi
 
+# 检测系统包管理器
+PKG_MANAGER=""
+if command -v apt-get &>/dev/null; then
+    PKG_MANAGER="apt"
+elif command -v dnf &>/dev/null; then
+    PKG_MANAGER="dnf"
+elif command -v yum &>/dev/null; then
+    PKG_MANAGER="yum"
+else
+    error "不支持的操作系统（未检测到 apt/dnf/yum）"
+    exit 1
+fi
+
 # ============================================================
 # 获取服务器公网 IP
 # ============================================================
@@ -60,21 +75,146 @@ fi
 info "服务器公网 IP: ${SERVER_IP}"
 
 # ============================================================
-# 安装系统依赖
+# 检测是否存在旧安装（x-ui / 3x-ui）
 # ============================================================
-step "安装系统依赖"
-if command -v apt-get &>/dev/null; then
-    apt-get update -y -qq
-    apt-get install -y -qq curl openssl ca-certificates
-elif command -v dnf &>/dev/null; then
-    dnf install -y curl openssl ca-certificates
-elif command -v yum &>/dev/null; then
-    yum install -y curl openssl ca-certificates
-else
-    error "不支持的操作系统，请手动安装 curl 和 openssl 后重试"
-    exit 1
+OLD_INSTALL_FOUND="false"
+
+# 检查命令
+if command -v x-ui &>/dev/null; then
+    OLD_INSTALL_FOUND="true"
 fi
-info "依赖安装完成"
+
+# 检查目录
+for dir in "/usr/local/x-ui" "/etc/x-ui"; do
+    if [ -d "${dir}" ]; then
+        OLD_INSTALL_FOUND="true"
+    fi
+done
+
+# 检查 systemd 服务
+if systemctl list-unit-files 2>/dev/null | grep -q "x-ui.service"; then
+    OLD_INSTALL_FOUND="true"
+fi
+
+# 检查进程
+if pgrep -f "x-ui" &>/dev/null || pgrep -f "xray" &>/dev/null; then
+    OLD_INSTALL_FOUND="true"
+fi
+
+# ============================================================
+# 【场景二】老 VPS 覆盖安装：彻底清理旧安装，零残留
+# ============================================================
+if [ "${OLD_INSTALL_FOUND}" = "true" ]; then
+    step "检测到旧版 x-ui / 3x-ui 安装，执行彻底清理（覆盖安装模式）"
+
+    # 1. 停止并禁用服务
+    info "停止 x-ui 服务..."
+    systemctl stop x-ui 2>/dev/null || true
+    systemctl disable x-ui 2>/dev/null || true
+
+    # 2. 杀掉所有残留进程（x-ui 主进程 + xray 内核进程）
+    info "终止残留进程..."
+    pkill -9 -f "x-ui" 2>/dev/null || true
+    pkill -9 -f "xray" 2>/dev/null || true
+    sleep 1
+
+    # 双重确认进程已清除
+    if pgrep -f "x-ui" &>/dev/null || pgrep -f "xray" &>/dev/null; then
+        warn "仍有残留进程，再次强制终止..."
+        pkill -9 -f "x-ui" 2>/dev/null || true
+        pkill -9 -f "xray" 2>/dev/null || true
+        sleep 1
+    fi
+
+    # 3. 删除所有相关文件和目录
+    info "删除程序文件与配置数据..."
+    rm -rf /usr/local/x-ui          # 主程序目录
+    rm -rf /etc/x-ui                # 配置 & 数据库 & 证书目录
+    rm -rf /var/log/x-ui            # 日志目录
+    rm -f /usr/bin/x-ui             # 命令软链接
+    rm -f /usr/local/bin/x-ui       # 命令软链接
+    rm -f /etc/systemd/system/x-ui.service   # systemd 服务文件
+    rm -f /lib/systemd/system/x-ui.service   # systemd 服务文件（备选路径）
+    rm -f /etc/init.d/x-ui          # init.d 脚本（兼容老系统）
+
+    # 4. 重载 systemd
+    systemctl daemon-reload 2>/dev/null || true
+
+    # 5. 释放被占用的端口
+    info "释放端口占用..."
+    if command -v lsof &>/dev/null; then
+        PORT_PID=$(lsof -ti:2053 -ti:2052 -ti:"${PANEL_PORT}" 2>/dev/null || true)
+        if [ -n "${PORT_PID}" ]; then
+            kill -9 ${PORT_PID} 2>/dev/null || true
+        fi
+    fi
+
+    # 6. 清理旧防火墙规则中残留的 x-ui 端口（可选，仅移除特定端口）
+    if command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -q "active"; then
+        ufw delete allow 2053/tcp 2>/dev/null || true
+        ufw delete allow 2052/tcp 2>/dev/null || true
+    fi
+
+    info "旧安装清理完成，零残留"
+else
+    info "未检测到旧版 x-ui / 3x-ui，执行全新安装"
+fi
+
+# ============================================================
+# 【场景一】新 VPS 系统初始化
+# ============================================================
+step "系统初始化"
+
+# 1. 更新系统软件包
+info "更新系统软件包..."
+if [ "${PKG_MANAGER}" = "apt" ]; then
+    apt-get update -y -qq
+    DEBIAN_FRONTEND=noninteractive apt-get upgrade -y -qq
+elif [ "${PKG_MANAGER}" = "dnf" ]; then
+    dnf upgrade -y -q
+elif [ "${PKG_MANAGER}" = "yum" ]; then
+    yum update -y -q
+fi
+
+# 2. 安装基础工具
+info "安装基础工具..."
+if [ "${PKG_MANAGER}" = "apt" ]; then
+    apt-get install -y -qq curl wget vim htop net-tools unzip ca-certificates openssl lsof
+elif [ "${PKG_MANAGER}" = "dnf" ]; then
+    dnf install -y -q curl wget vim htop net-tools unzip ca-certificates openssl lsof
+elif [ "${PKG_MANAGER}" = "yum" ]; then
+    yum install -y -q curl wget vim htop net-tools unzip ca-certificates openssl lsof
+fi
+
+# 3. 设置时区
+info "设置系统时区为 ${TIMEZONE}..."
+if command -v timedatectl &>/dev/null; then
+    timedatectl set-timezone "${TIMEZONE}" 2>/dev/null || true
+else
+    ln -sf "/usr/share/zoneinfo/${TIMEZONE}" /etc/localtime 2>/dev/null || true
+fi
+
+# 4. 开启 BBR 拥塞控制（提升网络性能）
+if [ "${ENABLE_BBR}" = "true" ]; then
+    info "配置 BBR 拥塞控制..."
+    if ! sysctl net.ipv4.tcp_congestion_control 2>/dev/null | grep -q "bbr"; then
+        # 检查内核是否支持 BBR
+        if modprobe tcp_bbr 2>/dev/null || lsmod | grep -q bbr; then
+            cat > /etc/sysctl.d/99-bbr.conf << EOF
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+EOF
+            sysctl -p /etc/sysctl.d/99-bbr.conf 2>/dev/null || true
+            info "BBR 已启用"
+        else
+            warn "当前内核不支持 BBR，跳过（建议使用 4.9+ 内核）"
+        fi
+    else
+        info "BBR 已处于启用状态"
+    fi
+fi
+
+info "系统初始化完成"
 
 # ============================================================
 # 生成自签 SSL 证书（含 IP SAN，浏览器可识别）
@@ -126,15 +266,11 @@ info "  证书: ${CERT_FILE}"
 info "  私钥: ${KEY_FILE}"
 
 # ============================================================
-# 安装 3x-ui（无人值守模式）
+# 全新安装 3x-ui（无人值守模式）
 # ============================================================
 step "安装 3x-ui 面板"
-if command -v x-ui &>/dev/null; then
-    warn "检测到 3x-ui 已安装，跳过安装步骤，直接进行配置"
-else
-    XUI_NONINTERACTIVE=1 bash <(curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh)
-    info "3x-ui 安装完成"
-fi
+XUI_NONINTERACTIVE=1 bash <(curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh)
+info "3x-ui 安装完成"
 
 # 等待服务初始化
 sleep 3
@@ -194,11 +330,14 @@ fi
 # 输出部署结果
 # ============================================================
 PANEL_URL="https://${SERVER_IP}:${PANEL_PORT}/${WEB_BASE_PATH}"
+INSTALL_MODE=$([ "${OLD_INSTALL_FOUND}" = "true" ] && echo "覆盖安装（已清理旧版）" || echo "全新安装")
 
 echo ""
 echo "╔══════════════════════════════════════════════════════════╗"
 echo "║           3x-ui 面板部署完成！                           ║"
 echo "╠══════════════════════════════════════════════════════════╣"
+echo -e "║  安装模式: ${GREEN}${INSTALL_MODE}${NC}"
+echo "║                                                          ║"
 echo -e "║  面板地址: ${GREEN}${PANEL_URL}${NC}"
 echo "║                                                          ║"
 echo -e "║  用户名:   ${GREEN}${USERNAME}${NC}"
