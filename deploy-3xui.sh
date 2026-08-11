@@ -277,10 +277,10 @@ config_panel() {
         -subj "/CN=${LOCAL_IP}" 2>/dev/null
     chmod 600 /etc/x-ui/ssl/key.pem
 
-    # 配置面板使用 SSL 证书
+    # 配置面板使用 SSL 证书（flag 名为 -webCert / -webCertKey，设了就自动开启 HTTPS）
     info "开启面板 HTTPS..."
-    /usr/local/x-ui/x-ui setting -certFile /etc/x-ui/ssl/cert.pem \
-        -keyFile /etc/x-ui/ssl/key.pem 2>&1 || {
+    /usr/local/x-ui/x-ui setting -webCert /etc/x-ui/ssl/cert.pem \
+        -webCertKey /etc/x-ui/ssl/key.pem 2>&1 || {
         warn "SSL 证书配置可能失败，面板将以 HTTP 模式运行"
     }
     info "SSL 证书配置完成"
