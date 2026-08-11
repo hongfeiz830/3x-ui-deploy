@@ -189,8 +189,22 @@ install_deps() {
 # ---- 安装 3x-ui ----
 install_3xui() {
     step "2/7 安装 3x-ui"
-    # 官方安装脚本
+
+    # 通过环境变量预设面板配置，官方安装器会直接使用，不会生成随机值
+    # 官方支持的环境变量：XUI_USERNAME, XUI_PASSWORD, XUI_PANEL_PORT, XUI_WEB_BASE_PATH
+    # NONINTERACTIVE=1 跳过交互式数据库选择，默认用 SQLite
+    export XUI_USERNAME="$USERNAME"
+    export XUI_PASSWORD="$PASSWORD"
+    export XUI_PANEL_PORT="$PANEL_PORT"
+    export XUI_WEB_BASE_PATH="$PANEL_PATH"
+    export NONINTERACTIVE=1
+    export XUI_DB_TYPE=sqlite
+
+    info "传入环境变量: 用户=$USERNAME 端口=$PANEL_PORT 路径=$PANEL_PATH"
     bash <(curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh)
+
+    # 清理环境变量
+    unset XUI_USERNAME XUI_PASSWORD XUI_PANEL_PORT XUI_WEB_BASE_PATH NONINTERACTIVE XUI_DB_TYPE
 
     # 等待服务启动
     sleep 3
@@ -241,10 +255,10 @@ config_panel() {
     systemctl stop x-ui 2>/dev/null || true
     sleep 1
 
-    # 设置面板端口、路径、用户名密码 —— 不再用 2>/dev/null || true，让错误暴露
+    # 设置面板端口、路径、用户名密码 —— 使用官方正确的 flag 名 -webBasePath（非 -path）
     info "设置面板端口=$PANEL_PORT 路径=/$PANEL_PATH ..."
     SETTING_OUTPUT=$(/usr/local/x-ui/x-ui setting -port "$PANEL_PORT" \
-        -path "$PANEL_PATH" \
+        -webBasePath "$PANEL_PATH" \
         -username "$USERNAME" \
         -password "$PASSWORD" 2>&1) || {
         warn "setting 命令输出: $SETTING_OUTPUT"
