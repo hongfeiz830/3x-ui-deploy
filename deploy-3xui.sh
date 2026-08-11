@@ -266,6 +266,25 @@ config_panel() {
     }
     info "setting 命令执行完成"
 
+    # ===== 生成自签证书并开启 HTTPS =====
+    info "生成自签 SSL 证书..."
+    mkdir -p /etc/x-ui/ssl
+    # 获取本机 IP 作为证书 CN
+    LOCAL_IP=$(curl -s4 ifconfig.me 2>/dev/null || echo "127.0.0.1")
+    openssl req -new -newkey rsa:2048 -nodes -x509 -days 3650 \
+        -keyout /etc/x-ui/ssl/key.pem \
+        -out /etc/x-ui/ssl/cert.pem \
+        -subj "/CN=${LOCAL_IP}" 2>/dev/null
+    chmod 600 /etc/x-ui/ssl/key.pem
+
+    # 配置面板使用 SSL 证书
+    info "开启面板 HTTPS..."
+    /usr/local/x-ui/x-ui setting -certFile /etc/x-ui/ssl/cert.pem \
+        -keyFile /etc/x-ui/ssl/key.pem 2>&1 || {
+        warn "SSL 证书配置可能失败，面板将以 HTTP 模式运行"
+    }
+    info "SSL 证书配置完成"
+
     # 重启面板使配置生效
     systemctl restart x-ui
     sleep 3
